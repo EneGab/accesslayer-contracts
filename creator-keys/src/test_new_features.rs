@@ -127,10 +127,10 @@ fn test_whitelist_mode_and_permissions() {
     // Enable whitelist
     client.enable_whitelist(&creator);
 
-    // Buy by non-whitelisted wallet fails with NotWhitelisted
+    // Buy by non-whitelisted wallet fails with WhitelistOnly
     assert_eq!(
         client.try_buy_key(&creator, &wallet, &1000i128, &None),
-        Err(Ok(ContractError::NotWhitelisted))
+        Err(Ok(ContractError::WhitelistOnly))
     );
 
     // Add to whitelist
@@ -145,7 +145,7 @@ fn test_whitelist_mode_and_permissions() {
     let buyer2 = Address::generate(&env);
     assert_eq!(
         client.try_buy_key(&creator, &buyer2, &1000i128, &None),
-        Err(Ok(ContractError::NotWhitelisted))
+        Err(Ok(ContractError::WhitelistOnly))
     );
 
     // Disable whitelist mode

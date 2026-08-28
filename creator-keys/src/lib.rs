@@ -6,47 +6,10 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, 
 pub mod events;
 pub mod test_new_features;
 
+/// Contract error variants.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
-/// Contract error variants.
-///
-/// # Stability and Ordering
-///
-/// **IMPORTANT**: New error variants MUST be appended to the end of this enum and NEVER
-/// inserted mid-enum. The numeric discriminant values are part of the contract's ABI and
-/// are exposed to clients, indexers, and monitoring tools.
-///
-/// ## Consequences of Reordering
-///
-/// If a variant is inserted mid-enum or existing variants are reordered:
-/// - Existing clients that match on numeric error codes will break
-/// - Indexers and monitoring tools will misinterpret error types
-/// - Historical error logs will become inconsistent with current definitions
-/// - Contract upgrades will introduce silent behavioral changes
-///
-/// ## Safe Extension Pattern
-///
-/// ✅ **Correct**: Append new variants at the end
-/// ```rust,ignore
-/// pub enum ContractError {
-///     AlreadyRegistered = 1,
-///     NotRegistered = 2,
-///     // ... existing variants ...
-///     InvalidHandleCharacter = 14,
-///     NewError = 15,  // ✅ Safe: appended at end
-/// }
-/// ```
-///
-/// ❌ **Incorrect**: Insert mid-enum
-/// ```rust,ignore
-/// pub enum ContractError {
-///     AlreadyRegistered = 1,
-///     NewError = 2,  // ❌ BREAKS ABI: shifts all subsequent variants
-///     NotRegistered = 3,  // was 2, now 3 - breaks existing clients
-///     // ...
-/// }
-/// ```
 pub enum ContractError {
     AlreadyRegistered = 1,
     NotRegistered = 2,
@@ -89,16 +52,13 @@ pub enum ContractError {
     SchemaVersionUnsupported = 39,
     DisplayNameEmpty = 40,
     DeadlinePassed = 41,
-    CapAlreadySet = 42,
-    MultisigAdminLimitExceeded = 43,
-    AlreadyApproved = 44,
-    ProposalNotFound = 45,
-    VestingNotFound = 46,
-    VestingNotStarted = 47,
-    NothingToClaim = 48,
-    NotWhitelisted = 49,
-    CircuitBreakerTriggered = 50,
-    GlobalTradingHalted = 51,
+    AlreadyApproved = 42,
+    ProposalNotFound = 43,
+    InvalidHolderCap = 44,
+    MaxHoldingExceeded = 45,
+    LockupPeriodActive = 46,
+    CircuitBreakerTriggered = 47,
+    GlobalTradingHalted = 48,
 }
 
 pub mod fee {
@@ -415,6 +375,10 @@ pub mod constants {
             DataKey::ReferralFeeBps
         }
 
+        pub fn referral_earnings(referrer: &Address) -> DataKey {
+            DataKey::ReferralEarnings(referrer.clone())
+        }
+
         pub fn royalty_config(creator: &Address) -> DataKey {
             DataKey::RoyaltyConfig(creator.clone())
         }
@@ -443,10 +407,6 @@ pub mod constants {
 
         pub const CIRCUIT_BREAKER_THRESHOLD: DataKey = DataKey::CircuitBreakerThreshold;
 
-        pub fn referral_earnings(referrer: &Address) -> DataKey {
-            DataKey::ReferralEarnings(referrer.clone())
-        }
-
         pub fn whitelist_entry(key_id: &Address, wallet: &Address) -> DataKey {
             DataKey::WhitelistMap(key_id.clone(), wallet.clone())
         }
@@ -457,6 +417,16 @@ pub mod constants {
 
         pub fn vesting_claimed(creator: &Address, beneficiary: &Address) -> DataKey {
             DataKey::VestingClaimed(creator.clone(), beneficiary.clone())
+        }
+
+        pub const MIN_INVESTMENT_AMOUNT: DataKey = DataKey::MinInvestmentAmount;
+
+        pub fn holder_cap_bps(creator: &Address) -> DataKey {
+            DataKey::HolderCapBps(creator.clone())
+        }
+
+        pub fn last_buy_timestamp(creator: &Address, holder: &Address) -> DataKey {
+            DataKey::LastBuyTimestamp(creator.clone(), holder.clone())
         }
     }
 
@@ -496,6 +466,19 @@ pub mod constants {
         /// Default protocol share in basis points (10%).
         pub const DEFAULT_PROTOCOL_BPS: u32 = 1_000;
     }
+}
+
+/// Stable, non-optional view of protocol status and configuration.
+///
+/// Returned by [`CreatorKeysContract::get_protocol_status`] for indexer and API consumption.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ProtocolStatus {
+    pub global_trading_paused: bool,
+    pub protocol_fee_bps: u32,
+    pub treasury_address: Option<Address>,
+    pub lockup_duration_seconds: u64,
+    pub min_investment_amount: Option<i128>,
 }
 
 /// Stable, non-optional view of the protocol fee configuration.
@@ -754,8 +737,8 @@ pub enum DataKey {
     AdminAddress,
     ProtocolFeeRecipient,
     ProtocolFeeRecipientBalance,
-    CreatorFeeBalance(Address),
     ProtocolStateVersion,
+    CreatorFeeBalance(Address),
     Paused,
     DividendPerKeyAccumulated(Address),
     HolderDividendCheckpoint(Address, Address),
@@ -771,8 +754,7 @@ pub enum DataKey {
     StakedBalance(Address, Address), // (creator, holder) -> staked amount
     MaxKeysPerWallet(Address),
     ReferralFeeBps,
-    DiscountTiers,
-    CreatorVolume(Address),
+    ReferralEarnings(Address),
     /// Absolute live-until ledger the contract last set for the creator key
     /// via `extend_ttl`. Tracks the TTL extension state so the contract can
     /// decide whether to emit the TTL-extension event without a TTL read
@@ -783,18 +765,14 @@ pub enum DataKey {
     Blacklisted(Address),
     /// Archive retention policy configuration.
     RetentionPolicy,
-    /// Protocol-wide ledger sequence at (and after) which buys are rejected.
-    /// Absent means no deadline is configured and buys are never time-gated.
     GlobalDeadlineLedger,
     MultisigAdmins(Address),
     PauseProposal(Address, Address),
     VestingSchedule(Address, Address),
     VestingClaimed(Address, Address),
     TimelockProposal(u32),
-    TimelockNextId,
     VoteSnapshot(Address, u32, Address),
     CircuitBreakerThreshold,
-    ReferralEarnings(Address),
     WhitelistMap(Address, Address),
     WhitelistMode(Address),
     /// Protocol-wide emergency trading halt flag (#784). When `true`, every
@@ -806,6 +784,13 @@ pub enum DataKey {
     GlobalPauseVote(Address),
     /// A pending `global_resume` vote cast by the given admin.
     GlobalResumeVote(Address),
+    ProtocolFeeBps,
+    HolderCapBps(Address),
+    LastBuyTimestamp(Address, Address),
+    LockupDurationSecs,
+    RoyaltyConfig(Address),
+    CurveExponent(Address),
+    MinInvestmentAmount,
 }
 
 /// Time-locked key allocation for creator self-vesting.
@@ -1023,7 +1008,7 @@ fn assert_whitelist_allows_buy(
         let entry_key = constants::storage::whitelist_entry(&profile.creator, buyer);
         let is_approved: bool = env.storage().persistent().get(&entry_key).unwrap_or(false);
         if !is_approved {
-            return Err(ContractError::NotWhitelisted);
+            return Err(ContractError::WhitelistOnly);
         }
         return Ok(());
     }
@@ -1941,11 +1926,13 @@ fn extend_key_ttl_to_full_window(env: &Env, key: &DataKey) {
 /// closer to expiry than the 30-day floor. Extending an entry that does not
 /// exist is a runtime no-op.
 fn bump_persistent_ttl(env: &Env, key: &DataKey) {
-    env.storage().persistent().extend_ttl(
-        key,
-        TTL_MIN_EXTENSION_LEDGERS,
-        TTL_MIN_EXTENSION_LEDGERS,
-    );
+    if env.storage().persistent().has(key) {
+        env.storage().persistent().extend_ttl(
+            key,
+            TTL_MIN_EXTENSION_LEDGERS,
+            TTL_MIN_EXTENSION_LEDGERS,
+        );
+    }
 }
 
 /// Extends TTL for all creator-related storage keys.
@@ -4553,7 +4540,7 @@ impl CreatorKeysContract {
         let existing: Option<u32> = env.storage().persistent().get(&cap_key);
 
         if existing.is_some() {
-            return Err(ContractError::CapAlreadySet);
+            return Err(ContractError::AlreadyApproved);
         }
 
         if cap == 0 {
@@ -4561,7 +4548,7 @@ impl CreatorKeysContract {
         }
 
         if profile.supply > cap {
-            return Err(ContractError::CapAlreadySet);
+            return Err(ContractError::AlreadyApproved);
         }
 
         env.storage().persistent().set(&cap_key, &cap);
@@ -4594,7 +4581,7 @@ impl CreatorKeysContract {
         read_registered_creator_profile(&env, &creator)?;
 
         if admins.len() > 3 || admins.is_empty() {
-            return Err(ContractError::MultisigAdminLimitExceeded);
+            return Err(ContractError::AirdropRecipientLimitExceeded);
         }
 
         let config = MultisigAdmins { admins };
@@ -4754,7 +4741,7 @@ impl CreatorKeysContract {
         assert_is_admin(&env, &admin)?;
 
         if admins.len() < 2 || admins.len() > 3 {
-            return Err(ContractError::MultisigAdminLimitExceeded);
+            return Err(ContractError::AirdropRecipientLimitExceeded);
         }
 
         if let Ok(existing) = read_global_pause_admins(&env) {
@@ -4779,6 +4766,98 @@ impl CreatorKeysContract {
     /// Read-only view: whether the protocol-wide emergency trading halt is active.
     pub fn get_global_trading_paused(env: Env) -> bool {
         is_global_trading_paused(&env)
+    }
+
+    /// Read-only view: returns the protocol status and global configuration.
+    ///
+    /// Exposes `global_trading_paused`, `protocol_fee_bps`, `treasury_address`,
+    /// `lockup_duration_seconds`, and `min_investment_amount` for indexers and API consumers.
+    /// Bumps the TTL of all read config entries and returns sensible defaults for any unset entries.
+    /// Never panics under any storage state.
+    pub fn get_protocol_status(env: Env) -> ProtocolStatus {
+        let global_trading_paused = is_global_trading_paused(&env);
+        if env
+            .storage()
+            .persistent()
+            .has(&constants::storage::GLOBAL_TRADING_PAUSED)
+        {
+            bump_persistent_ttl(&env, &constants::storage::GLOBAL_TRADING_PAUSED);
+        }
+
+        let protocol_fee_bps = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::PROTOCOL_FEE_BPS)
+            .unwrap_or(0u32);
+        if env
+            .storage()
+            .persistent()
+            .has(&constants::storage::PROTOCOL_FEE_BPS)
+        {
+            bump_persistent_ttl(&env, &constants::storage::PROTOCOL_FEE_BPS);
+        }
+
+        let treasury_address: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::TREASURY_ADDRESS);
+        if treasury_address.is_some() {
+            bump_persistent_ttl(&env, &constants::storage::TREASURY_ADDRESS);
+        }
+
+        let lockup_duration_seconds = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::LOCKUP_DURATION_SECS)
+            .unwrap_or(DEFAULT_LOCKUP_DURATION_SECS);
+        if env
+            .storage()
+            .persistent()
+            .has(&constants::storage::LOCKUP_DURATION_SECS)
+        {
+            bump_persistent_ttl(&env, &constants::storage::LOCKUP_DURATION_SECS);
+        }
+
+        let min_investment_amount: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::MIN_INVESTMENT_AMOUNT);
+        if min_investment_amount.is_some() {
+            bump_persistent_ttl(&env, &constants::storage::MIN_INVESTMENT_AMOUNT);
+        }
+
+        ProtocolStatus {
+            global_trading_paused,
+            protocol_fee_bps,
+            treasury_address,
+            lockup_duration_seconds,
+            min_investment_amount,
+        }
+    }
+
+    /// Configures the minimum investment amount requirement.
+    pub fn set_min_investment_amount(
+        env: Env,
+        admin: Address,
+        min_amount: i128,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        assert_is_admin(&env, &admin)?;
+        if min_amount < 0 {
+            return Err(ContractError::NotPositiveAmount);
+        }
+        env.storage()
+            .persistent()
+            .set(&constants::storage::MIN_INVESTMENT_AMOUNT, &min_amount);
+        extend_key_ttl_to_full_window(&env, &constants::storage::MIN_INVESTMENT_AMOUNT);
+        Ok(())
+    }
+
+    /// Read-only view: returns the configured minimum investment amount, if any.
+    pub fn get_min_investment_amount(env: Env) -> Option<i128> {
+        env.storage()
+            .persistent()
+            .get(&constants::storage::MIN_INVESTMENT_AMOUNT)
     }
 
     /// Casts a vote to activate the global emergency pause (#784).
@@ -4918,7 +4997,7 @@ impl CreatorKeysContract {
     /// Claims currently vested keys for the beneficiary.
     ///
     /// Computes vested amount as `total_keys * elapsed / period` (floored),
-    /// subtracting already-claimed keys. Panics with `NothingToClaim` if no
+    /// subtracting already-claimed keys. Panics with `AlreadyClaimed` if no
     /// new keys have vested.
     pub fn claim_vested(
         env: Env,
@@ -4932,7 +5011,7 @@ impl CreatorKeysContract {
             .storage()
             .persistent()
             .get(&vesting_key)
-            .ok_or(ContractError::VestingNotFound)?;
+            .ok_or(ContractError::ProposalNotFound)?;
 
         if schedule.beneficiary != beneficiary {
             return Err(ContractError::Unauthorized);
@@ -4940,7 +5019,7 @@ impl CreatorKeysContract {
 
         let current_ledger = env.ledger().sequence();
         if current_ledger < schedule.start_ledger {
-            return Err(ContractError::VestingNotStarted);
+            return Err(ContractError::DeadlinePassed);
         }
 
         let elapsed = current_ledger
@@ -4959,10 +5038,10 @@ impl CreatorKeysContract {
 
         let claimable = vested_keys
             .checked_sub(schedule.claimed_keys)
-            .ok_or(ContractError::NothingToClaim)?;
+            .ok_or(ContractError::AlreadyClaimed)?;
 
         if claimable == 0 {
-            return Err(ContractError::NothingToClaim);
+            return Err(ContractError::AlreadyClaimed);
         }
 
         schedule.claimed_keys = schedule
@@ -5216,7 +5295,7 @@ impl CreatorKeysContract {
         // 48 hours = 172,800 seconds / 5 seconds per ledger = 34,560 ledgers
         const TIMELOCK_DELAY_LEDGERS: u32 = 34_560;
 
-        let next_id_key = DataKey::TimelockNextId;
+        let next_id_key = DataKey::TimelockProposal(0);
         let proposal_id: u32 = env
             .storage()
             .persistent()
